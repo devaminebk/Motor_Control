@@ -1,0 +1,23 @@
+# --- Code Composer Studio / Eclipse Build Outputs ---
+# Ignore the entire build configuration output folder (contains .obj, .out, .map, etc.)
+/[Cc][Pp][Uu]1_*/
+/[Cc][Pp][Uu]2_*/
+/[Ff][尝]ash*/
+/Debug/
+/Release/
+
+# --- IDE and Tooling Caches ---
+# Local eclipse settings that shouldn't be shared across machines
+/.settings/
+# Clangd indexer cache
+**/.clangd/
+
+# --- TI Driverlib Build Outputs (if compiled locally) ---
+# Ignore the compiled libraries/objects inside your driverlib folder, but keep the sources
+**/driverlib/ccs/Debug/
+**/driverlib/ccs/Release/
+
+# --- General OS/IDE junk ---
+.DS_Store
+Thumbs.db
+*.bak

@@ -41,6 +41,8 @@ volatile float DEADBAND_NS = 1000.0f;   /* ns — temps mort RED = FED       */
 volatile int DB_RISE = 1 ;
 volatile int DB_FALL = 1 ;
 
+
+volatile int APPLY_THIRD_H = 1;
 /*===========================================================================
  * AJOUT TRIPHASÉ — déphasages fixes en unités de phase normalisée 32 bits
  *   2^32 / 3      ≈ 120°
@@ -437,8 +439,7 @@ void main(void)
 
 /*===========================================================================
  * ISR ePWM1 — déclenchée à f_carrier (variable)
- * AJOUT TRIPHASÉ : calcule et applique les 3 sinusoïdes (0°/120°/240°)
- * à partir d'un unique accumulateur de phase DDS.
+ * V6 : AVEC INJECTION DE TROISIÈME HARMONIQUE (THIPWM)
  *===========================================================================*/
 __interrupt void epwm1ISR(void)
 {
@@ -450,31 +451,58 @@ __interrupt void epwm1ISR(void)
     /* DDS — accumulateur de phase commun aux 3 bras */
     accum += increm;
 
-    /* Phase A = accum, Phase B = accum + 120°, Phase C = accum + 240°
-     * (le débordement uint32_t fait naturellement le modulo 360°)         */
+    /* Phase A = accum, Phase B = accum + 120°, Phase C = accum + 240° */
     float phaseA = (float)accum * (1.0f / 4294967296.0f);
     float phaseB = (float)(accum + PHASE_OFFSET_120) * (1.0f / 4294967296.0f);
     float phaseC = (float)(accum + PHASE_OFFSET_240) * (1.0f / 4294967296.0f);
     dbg_phase = phaseA;
 
+    /* Calcul des fondamentales */
     float sinA = __sinpuf32(phaseA);
     float sinB = __sinpuf32(phaseB);
     float sinC = __sinpuf32(phaseC);
-    dbg_sin   = sinA;
-    dbg_sin_b = sinB;
-    dbg_sin_c = sinC;
 
-    /* Mise à l'échelle CMPA — un calcul indépendant par bras */
-    float cmpaA_f = half * (1.0f + amp * sinA);
-    float cmpaB_f = half * (1.0f + amp * sinB);
-    float cmpaC_f = half * (1.0f + amp * sinC);
+    /* --- AJOUT INJECTION 3ÈME HARMONIQUE --- */
+    /* On multiplie l'accumulateur par 3 dans le domaine entier 
+       pour bénéficier du rebouclage automatique à 360° (overflow 32-bit) */
+    
+    uint32_t accum3 = 3U * accum;
+    float phase3 = (float)accum3 * (1.0f / 4294967296.0f);
+    float sin3 = __sinpuf32(phase3);
+    
+    /* V_inj = 1/6 * sin(3*theta). À 90° (sinA=1), sin3 vaut -1, 
+       ce qui donne 1 + 1/6*(-1) = 5/6, écrasant ainsi la bosse du signal. */
+    float injection ;
 
+    if (APPLY_THIRD_H){
+        injection = 0.166666667f * sin3; 
+    }
+    else{
+        injection = 0 ;
+    }
+
+    /* Application du signal modulant modifié aux 3 phases */
+    float modA = sinA + injection;
+    float modB = sinB + injection;
+    float modC = sinC + injection;
+
+    /* Mise à jour des variables de debug pour la Watch Window */
+    dbg_sin   = modA;
+    dbg_sin_b = modB;
+    dbg_sin_c = modC;
+
+    /* Mise à l'échelle CMPA — calcul basé sur la modulante modifiée */
+    float cmpaA_f = half * (1.0f + amp * modA);
+    float cmpaB_f = half * (1.0f + amp * modB);
+    float cmpaC_f = half * (1.0f + amp * modC);
+
+    /* Saturation de sécurité (anti-overmodulation matérielle) */
     if(cmpaA_f < 0.0f)           cmpaA_f = 0.0f;
-    if(cmpaA_f > (float)TBPRD)   cmpaA_f = (float)TBPRD;
+    if(cmpaA_f > (float) 1.15 * TBPRD)   cmpaA_f = (float) 1.15 * TBPRD;
     if(cmpaB_f < 0.0f)           cmpaB_f = 0.0f;
-    if(cmpaB_f > (float)TBPRD)   cmpaB_f = (float)TBPRD;
+    if(cmpaB_f > (float) 1.15 * TBPRD)   cmpaB_f = (float) 1.15 * TBPRD;
     if(cmpaC_f < 0.0f)           cmpaC_f = 0.0f;
-    if(cmpaC_f > (float)TBPRD)   cmpaC_f = (float)TBPRD;
+    if(cmpaC_f > (float) 1.15 * TBPRD)   cmpaC_f = (float) 1.15 *TBPRD;
 
     uint16_t cmpaA_val = (uint16_t)cmpaA_f;
     uint16_t cmpaB_val = (uint16_t)cmpaB_f;
@@ -487,7 +515,7 @@ __interrupt void epwm1ISR(void)
     HWREG(EPWM2_BASE + EPWM_O_CMPA) = ((uint32_t)cmpaB_val << 16U);
     HWREG(EPWM3_BASE + EPWM_O_CMPA) = ((uint32_t)cmpaC_val << 16U);
 
-    /* DAC-A / DAC-B / DAC-C — une sortie analogique par phase */
+    /* Sorties DAC de visualisation (reflètent désormais la forme "selle de cheval") */
     uint16_t dacA_val = (uint16_t)((uint32_t)cmpaA_val * 4095U / (uint32_t)TBPRD);
     uint16_t dacB_val = (uint16_t)((uint32_t)cmpaB_val * 4095U / (uint32_t)TBPRD);
     uint16_t dacC_val = (uint16_t)((uint32_t)cmpaC_val * 4095U / (uint32_t)TBPRD);

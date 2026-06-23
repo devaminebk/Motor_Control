@@ -4,6 +4,11 @@
  *      - 3 bras (ePWM1/2/3) avec porteuse triangulaire COMMUNE et synchronisée
  *      - modulantes sinusoïdales déphasées de 0° / 120° / 240°
  *      - f_carrier + f_sinus + amplitude restent modifiables via Watch Window
+ * V5 : AJOUT DU DEAD-BAND (temps mort)
+ *      - sous-module DB activé sur EPWM1/2/3, mode AHC (Active High Complementary)
+ *      - EPWMxA = signal SPWM original, EPWMxB = complémentaire inversé + retard
+ *      - DEADBAND_NS modifiable en live (ns), RED = FED, commun aux 3 bras
+ *      - GPIO1/3/5 ajoutés (EPWM1B/2B/3B) pour sortir le bras complémentaire
  ******************************************************************************/
 
 #include "driverlib.h"
@@ -16,14 +21,25 @@
  *   FREQ_CARRIER  : 1 000 … 200 000 Hz  → TBPRD = 100 000 … 500
  *   FREQ_SINUS    : > 0  … FREQ_CARRIER/9 Hz
  *   AMPLITUDE     : 0.0 … 1.0
+ *   DEADBAND_NS   : 0 … 5 000 ns — temps mort RED = FED, commun aux 3 bras
  *
- * Ces 3 paramètres sont COMMUNS aux 3 phases (système triphasé équilibré).
+ * Ces 4 paramètres sont COMMUNS aux 3 phases (système triphasé équilibré).
  * Seul le déphasage (0° / 120° / 240°) diffère entre les bras.
  *===========================================================================*/
  /* Hz — porteuse triangulaire     */
 volatile float FREQ_CARRIER = 4000.0f;
 volatile float FREQ_SINUS   =  50.0f;   /* Hz — modulante sinusoïdale     */
 volatile float AMPLITUDE    =  0.80f;     /* 0.0 … 1.0 — indice modulation  */
+
+/*===========================================================================
+ * AJOUT DEAD-BAND — temps mort commun aux 3 bras (RED = FED = DEADBAND_NS)
+ *   Modifiable en live via Watch Window, comme les 3 paramètres ci-dessus.
+ *   SYSCLK = 200 MHz, pas de prescaler sur EPWMCLK → 1 compte DB = 5 ns.
+ *   Plage raisonnable : 0 … 5000 ns (0 … 1000 comptes).
+ *===========================================================================*/
+volatile float DEADBAND_NS = 1000.0f;   /* ns — temps mort RED = FED       */
+volatile int DB_RISE = 1 ;
+volatile int DB_FALL = 1 ;
 
 /*===========================================================================
  * AJOUT TRIPHASÉ — déphasages fixes en unités de phase normalisée 32 bits
@@ -41,6 +57,7 @@ volatile uint32_t increm     = 0U;
 volatile uint32_t accum      = 0U;        /* accumulateur de phase — référence Phase A  */
 volatile float    isr_amp    = 0.80f;     /* snapshot atomique pour l'ISR   */
 volatile float    isr_half   = 2500.0f;   /* TBPRD/2 pour l'ISR             */
+volatile uint16_t db_count   = 200U;      /* AJOUT DEAD-BAND : DEADBAND_NS en comptes TBCLK (5 ns/compte) */
 
 /*===========================================================================
  * DEBUG — Watch Window CCS
@@ -50,6 +67,7 @@ volatile uint16_t dbg_cmpa   = 0U;        /* Phase A */
 volatile uint16_t dbg_cmpa_b = 0U;        /* Phase B — AJOUT TRIPHASÉ */
 volatile uint16_t dbg_cmpa_c = 0U;        /* Phase C — AJOUT TRIPHASÉ */
 volatile uint16_t dbg_dac    = 0U;
+volatile uint16_t dbg_db_count = 0U;      /* AJOUT DEAD-BAND : comptes RED/FED réellement chargés */
 volatile float    dbg_phase  = 0.0f;
 volatile float    dbg_sin    = 0.0f;      /* Phase A */
 volatile float    dbg_sin_b  = 0.0f;      /* Phase B — AJOUT TRIPHASÉ */
@@ -78,14 +96,45 @@ static uint32_t calc_increm(float f_sin, float f_carrier)
     return (uint32_t)(4294967296.0f * (f_sin / f_carrier));
 }
 
+/* AJOUT DEAD-BAND : ns → comptes TBCLK                                       */
+/* SYSCLK = 200 MHz, EPWMCLK = SYSCLK (pas de prescaler) → 1 compte = 5 ns    */
+/* Registre RED/FED sur 10 bits utiles → max 1023 comptes ≈ 5115 ns          */
+static uint16_t calc_db_count(float ns)
+{
+    float counts_f = ns / 5.0f;             /* 1 compte TBCLK = 5 ns @200MHz */
+    if(counts_f < 0.0f)    counts_f = 0.0f;
+    if(counts_f > 1000.0f) counts_f = 1000.0f; /* garde-fou ~5 µs max        */
+    return (uint16_t)counts_f;
+}
+
+/* AJOUT DEAD-BAND : applique RED=FED=db sur les 3 bras (mode AHC)            */
+static void apply_deadband(uint16_t db, uint8_t Rise, uint8_t Fall)
+{
+    if (Rise)
+    {
+        EPWM_setRisingEdgeDelayCount(EPWM1_BASE, db);
+        EPWM_setRisingEdgeDelayCount(EPWM2_BASE, db);
+        EPWM_setRisingEdgeDelayCount(EPWM3_BASE, db);
+    }
+    
+    if (Fall)
+    {
+        EPWM_setFallingEdgeDelayCount(EPWM1_BASE, db);
+        EPWM_setFallingEdgeDelayCount(EPWM2_BASE, db);
+        EPWM_setFallingEdgeDelayCount(EPWM3_BASE, db);
+    }
+}
+
 /* Recalcul complet — appelé depuis la boucle principale                      */
 /* fc     : fréquence effective (fc_raw * 4) pour TBPRD                      */
 /* fc_raw : fréquence saisie par l'utilisateur pour le ratio DDS             */
-static void apply_params(float fc, float fc_raw, float fs, float amp)
+/* db_ns  : AJOUT DEAD-BAND — temps mort RED=FED en nanosecondes             */
+static void apply_params(float fc, float fc_raw, float fs, float amp, float db_ns)
 {
     uint16_t tbprd_new  = calc_tbprd(fc);
     uint32_t increm_new = calc_increm(fs, fc_raw);
     float    half_new   = (float)tbprd_new * 0.5f;
+    uint16_t db_new      = calc_db_count(db_ns);   /* AJOUT DEAD-BAND */
 
     /* Section critique : on coupe les IRQ le temps de tout mettre à jour    */
     DINT;
@@ -104,6 +153,9 @@ static void apply_params(float fc, float fc_raw, float fs, float amp)
     HWREG(EPWM2_BASE + EPWM_O_CMPA) = ((uint32_t)(tbprd_new / 2U) << 16U);
     HWREG(EPWM3_BASE + EPWM_O_CMPA) = ((uint32_t)(tbprd_new / 2U) << 16U);
 
+    /* 3bis. AJOUT DEAD-BAND : recharger RED/FED sur les 3 bras              */
+    apply_deadband(db_new, DB_RISE, DB_FALL);
+
     /* 4. Redémarrer la synchro (les 3 bras repartent alignés)               */
     SysCtl_enablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);
 
@@ -113,6 +165,8 @@ static void apply_params(float fc, float fc_raw, float fs, float amp)
     isr_amp  = amp;
     increm   = increm_new;
     accum    = 0U;   /* reset phase pour éviter un saut de phase             */
+    db_count = db_new;   /* AJOUT DEAD-BAND */
+    dbg_db_count = db_new;   /* AJOUT DEAD-BAND */
 
     EINT;
 }
@@ -136,6 +190,8 @@ void main(void)
     isr_amp  = AMPLITUDE;
     increm   = calc_increm(FREQ_SINUS, FREQ_CARRIER);
     accum    = 0U;
+    db_count = calc_db_count(DEADBAND_NS);   /* AJOUT DEAD-BAND */
+    dbg_db_count = db_count;                 /* AJOUT DEAD-BAND */
 
     /* GPIO0 → ePWM1A (Phase A) */
     GPIO_setPadConfig(0, GPIO_PIN_TYPE_STD);
@@ -143,17 +199,35 @@ void main(void)
     GPIO_setMasterCore(0, GPIO_CORE_CPU1);
     GPIO_setPinConfig(GPIO_0_EPWM1A);
 
+    /* GPIO1 → ePWM1B (Phase A, bras complémentaire) — AJOUT DEAD-BAND */
+    GPIO_setPadConfig(1, GPIO_PIN_TYPE_STD);
+    GPIO_setDirectionMode(1, GPIO_DIR_MODE_OUT);
+    GPIO_setMasterCore(1, GPIO_CORE_CPU1);
+    GPIO_setPinConfig(GPIO_1_EPWM1B);
+
     /* GPIO2 → ePWM2A (Phase B) — AJOUT TRIPHASÉ */
     GPIO_setPadConfig(2, GPIO_PIN_TYPE_STD);
     GPIO_setDirectionMode(2, GPIO_DIR_MODE_OUT);
     GPIO_setMasterCore(2, GPIO_CORE_CPU1);
     GPIO_setPinConfig(GPIO_2_EPWM2A);
 
+    /* GPIO3 → ePWM2B (Phase B, bras complémentaire) — AJOUT DEAD-BAND */
+    GPIO_setPadConfig(3, GPIO_PIN_TYPE_STD);
+    GPIO_setDirectionMode(3, GPIO_DIR_MODE_OUT);
+    GPIO_setMasterCore(3, GPIO_CORE_CPU1);
+    GPIO_setPinConfig(GPIO_3_EPWM2B);
+
     /* GPIO4 → ePWM3A (Phase C) — AJOUT TRIPHASÉ */
     GPIO_setPadConfig(4, GPIO_PIN_TYPE_STD);
     GPIO_setDirectionMode(4, GPIO_DIR_MODE_OUT);
     GPIO_setMasterCore(4, GPIO_CORE_CPU1);
     GPIO_setPinConfig(GPIO_4_EPWM3A);
+
+    /* GPIO5 → ePWM3B (Phase C, bras complémentaire) — AJOUT DEAD-BAND */
+    GPIO_setPadConfig(5, GPIO_PIN_TYPE_STD);
+    GPIO_setDirectionMode(5, GPIO_DIR_MODE_OUT);
+    GPIO_setMasterCore(5, GPIO_CORE_CPU1);
+    GPIO_setPinConfig(GPIO_5_EPWM3B);
 
     /* LED debug GPIO31 */
     GPIO_setPadConfig(31, GPIO_PIN_TYPE_STD);
@@ -214,6 +288,22 @@ void main(void)
                                   EPWM_AQ_OUTPUT_HIGH,
                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_DOWN_CMPA);
 
+    /* AJOUT DEAD-BAND : sous-module DB d'EPWM1 — mode AHC (Active High
+     * Complementary). EPWMB est généré à partir d'EPWMA (inversé), avec
+     * un retard RED à la montée et FED à la descente, pour créer le temps
+     * mort entre les deux interrupteurs complémentaires du bras A.        */
+    EPWM_setRisingEdgeDeadBandDelayInput(EPWM1_BASE, EPWM_DB_INPUT_EPWMA);
+    EPWM_setFallingEdgeDeadBandDelayInput(EPWM1_BASE, EPWM_DB_INPUT_EPWMA);
+    EPWM_setDeadBandDelayPolarity(EPWM1_BASE, EPWM_DB_RED,
+                                  EPWM_DB_POLARITY_ACTIVE_HIGH);
+    EPWM_setDeadBandDelayPolarity(EPWM1_BASE, EPWM_DB_FED,
+                                  EPWM_DB_POLARITY_ACTIVE_LOW);
+    EPWM_setDeadBandCounterClock(EPWM1_BASE, EPWM_DB_COUNTER_CLOCK_FULL_CYCLE);
+    EPWM_setRisingEdgeDelayCount(EPWM1_BASE, db_count);
+    EPWM_setFallingEdgeDelayCount(EPWM1_BASE, db_count);
+    EPWM_setDeadBandDelayMode(EPWM1_BASE, EPWM_DB_RED, true);
+    EPWM_setDeadBandDelayMode(EPWM1_BASE, EPWM_DB_FED, true);
+
     /* AJOUT TRIPHASÉ : EPWM1 émet un SYNCO à chaque passage à zéro du
      * compteur — c'est ce pulse qui garde EPWM2/EPWM3 alignés sur EPWM1.   */
     EPWM_setSyncOutPulseMode(EPWM1_BASE, EPWM_SYNC_OUT_PULSE_ON_COUNTER_ZERO);
@@ -240,6 +330,19 @@ void main(void)
                                   EPWM_AQ_OUTPUT_A,
                                   EPWM_AQ_OUTPUT_HIGH,
                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_DOWN_CMPA);
+
+    /* AJOUT DEAD-BAND : sous-module DB d'EPWM2 — mode AHC, bras B           */
+    EPWM_setRisingEdgeDeadBandDelayInput(EPWM2_BASE, EPWM_DB_INPUT_EPWMA);
+    EPWM_setFallingEdgeDeadBandDelayInput(EPWM2_BASE, EPWM_DB_INPUT_EPWMA);
+    EPWM_setDeadBandDelayPolarity(EPWM2_BASE, EPWM_DB_RED,
+                                  EPWM_DB_POLARITY_ACTIVE_HIGH);
+    EPWM_setDeadBandDelayPolarity(EPWM2_BASE, EPWM_DB_FED,
+                                  EPWM_DB_POLARITY_ACTIVE_LOW);
+    EPWM_setDeadBandCounterClock(EPWM2_BASE, EPWM_DB_COUNTER_CLOCK_FULL_CYCLE);
+    EPWM_setRisingEdgeDelayCount(EPWM2_BASE, db_count);
+    EPWM_setFallingEdgeDelayCount(EPWM2_BASE, db_count);
+    EPWM_setDeadBandDelayMode(EPWM2_BASE, EPWM_DB_RED, true);
+    EPWM_setDeadBandDelayMode(EPWM2_BASE, EPWM_DB_FED, true);
 
     /* Aucun déphasage du COMPTEUR : la porteuse triangulaire reste
      * identique sur les 3 bras, seule la sinusoïde de référence (calculée
@@ -272,6 +375,19 @@ void main(void)
                                   EPWM_AQ_OUTPUT_HIGH,
                                   EPWM_AQ_OUTPUT_ON_TIMEBASE_DOWN_CMPA);
 
+    /* AJOUT DEAD-BAND : sous-module DB d'EPWM3 — mode AHC, bras C           */
+    EPWM_setRisingEdgeDeadBandDelayInput(EPWM3_BASE, EPWM_DB_INPUT_EPWMA);
+    EPWM_setFallingEdgeDeadBandDelayInput(EPWM3_BASE, EPWM_DB_INPUT_EPWMA);
+    EPWM_setDeadBandDelayPolarity(EPWM3_BASE, EPWM_DB_RED,
+                                  EPWM_DB_POLARITY_ACTIVE_HIGH);
+    EPWM_setDeadBandDelayPolarity(EPWM3_BASE, EPWM_DB_FED,
+                                  EPWM_DB_POLARITY_ACTIVE_LOW);
+    EPWM_setDeadBandCounterClock(EPWM3_BASE, EPWM_DB_COUNTER_CLOCK_FULL_CYCLE);
+    EPWM_setRisingEdgeDelayCount(EPWM3_BASE, db_count);
+    EPWM_setFallingEdgeDelayCount(EPWM3_BASE, db_count);
+    EPWM_setDeadBandDelayMode(EPWM3_BASE, EPWM_DB_RED, true);
+    EPWM_setDeadBandDelayMode(EPWM3_BASE, EPWM_DB_FED, true);
+
     EPWM_enablePhaseShiftLoad(EPWM3_BASE);
     EPWM_setPhaseShift(EPWM3_BASE, 0U);
 
@@ -296,21 +412,25 @@ void main(void)
     float last_fc  = FREQ_CARRIER;
     float last_fs  = FREQ_SINUS;
     float last_amp = AMPLITUDE;
+    float last_db  = DEADBAND_NS;   /* AJOUT DEAD-BAND */
 
     while(1)
     {
         float cur_fc  = FREQ_CARRIER;
         float cur_fs  = FREQ_SINUS;
         float cur_amp = AMPLITUDE;
+        float cur_db  = DEADBAND_NS;   /* AJOUT DEAD-BAND */
 
-        if(cur_fc != last_fc || cur_fs != last_fs || cur_amp != last_amp)
+        if(cur_fc != last_fc || cur_fs != last_fs || cur_amp != last_amp
+           || cur_db != last_db)
         {
             /* eff_carrier : x4 pour que f_oscillo = f_saisie */
             float eff_carrier = cur_fc * 4.0f;
-            apply_params(eff_carrier, cur_fc, cur_fs, cur_amp);
+            apply_params(eff_carrier, cur_fc, cur_fs, cur_amp, cur_db);
             last_fc  = cur_fc;
             last_fs  = cur_fs;
             last_amp = cur_amp;
+            last_db  = cur_db;   /* AJOUT DEAD-BAND */
         }
     }
 }

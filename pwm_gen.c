@@ -473,11 +473,14 @@ __interrupt void epwm1ISR(void)
     /* V_inj = 1/6 * sin(3*theta). À 90° (sinA=1), sin3 vaut -1, 
        ce qui donne 1 + 1/6*(-1) = 5/6, écrasant ainsi la bosse du signal. */
     float injection ;
+    float max_sin;
 
     if (APPLY_THIRD_H){
-        injection = 0.166666667f * sin3; 
+        injection = 0.166666667f * sin3;
+        max_sin = 1.1547 ; 
     }
     else{
+        max_sin = 0 ;
         injection = 0 ;
     }
 
@@ -498,11 +501,11 @@ __interrupt void epwm1ISR(void)
 
     /* Saturation de sécurité (anti-overmodulation matérielle) */
     if(cmpaA_f < 0.0f)           cmpaA_f = 0.0f;
-    if(cmpaA_f > (float) 1.15 * TBPRD)   cmpaA_f = (float) 1.15 * TBPRD;
+    if(cmpaA_f > (float) (1 + max_sin) * TBPRD)   cmpaA_f = (float) (1 + max_sin) * TBPRD;
     if(cmpaB_f < 0.0f)           cmpaB_f = 0.0f;
-    if(cmpaB_f > (float) 1.15 * TBPRD)   cmpaB_f = (float) 1.15 * TBPRD;
+    if(cmpaB_f > (float) (1 + max_sin) * TBPRD)   cmpaB_f = (float) (1 + max_sin) * TBPRD;
     if(cmpaC_f < 0.0f)           cmpaC_f = 0.0f;
-    if(cmpaC_f > (float) 1.15 * TBPRD)   cmpaC_f = (float) 1.15 *TBPRD;
+    if(cmpaC_f > (float) (1 + max_sin) * TBPRD)   cmpaC_f = (float) (1 + max_sin) *TBPRD;
 
     uint16_t cmpaA_val = (uint16_t)cmpaA_f;
     uint16_t cmpaB_val = (uint16_t)cmpaB_f;

@@ -9,6 +9,22 @@
  *      - EPWMxA = signal SPWM original, EPWMxB = complémentaire inversé + retard
  *      - DEADBAND_NS modifiable en live (ns), RED = FED, commun aux 3 bras
  *      - GPIO1/3/5 ajoutés (EPWM1B/2B/3B) pour sortir le bras complémentaire
+ *
+ * FIX (deadband) :
+ *      - DB_RISE_FALL était initialisé à 11 (DECIMAL onze), ce qui ne
+ *        correspond à AUCUN des cas testés par apply_deadband() (0,1,2,
+ *        sinon "both"). Toute valeur != 0,1,2 retombe dans le "else" =
+ *        RED+FED actifs => explique pourquoi 01/10 "agissaient comme 11".
+ *        -> valeur par défaut corrigée à 3 (0b11 = RED+FED), et il faut
+ *           écrire des valeurs DÉCIMALES (0, 1, 2, 3) dans la Watch
+ *           Window, PAS des littéraux "0b01"/"0b10" (non supportés par
+ *           CCS Watch Window).
+ *      - EPWM_DB_COUNTER_CLOCK_FULL_CYCLE faisait tourner le compteur DB
+ *        à TBCLK/2 : chaque compte valait donc 10 ns et non 5 ns, et
+ *        comme RED+FED sont tous deux affectés, l'écart mesuré entre les
+ *        deux signaux complémentaires ressortait à 4x le réglage voulu
+ *        au lieu de 2x. -> corrigé en EPWM_DB_COUNTER_CLOCK_HALF_CYCLE
+ *        (1 compte = 1 période TBCLK = 5 ns @ 200 MHz), sur les 3 bras.
  ******************************************************************************/
 
 #include "driverlib.h"
@@ -34,12 +50,25 @@ volatile float AMPLITUDE    =  0.80f;     /* 0.0 … 1.0 — indice modulation  
 /*===========================================================================
  * AJOUT DEAD-BAND — temps mort commun aux 3 bras (RED = FED = DEADBAND_NS)
  *   Modifiable en live via Watch Window, comme les 3 paramètres ci-dessus.
- *   SYSCLK = 200 MHz, pas de prescaler sur EPWMCLK → 1 compte DB = 5 ns.
+ *   SYSCLK = 200 MHz, pas de prescaler sur EPWMCLK, mode HALF_CYCLE
+ *   => 1 compte DB = 5 ns (FIX : voir note en tête de fichier).
  *   Plage raisonnable : 0 … 5000 ns (0 … 1000 comptes).
  *===========================================================================*/
 volatile float DEADBAND_NS = 1000.0f;   /* ns — temps mort RED = FED       */
-volatile int DB_RISE = 1 ;
-volatile int DB_FALL = 1 ;
+
+/* FIX : DB_RISE_FALL doit être une valeur DÉCIMALE parmi :
+ *   0 -> aucun deadband (bypass RED et FED)
+ *   1 -> FED seul (0b01)
+ *   2 -> RED seul (0b10)
+ *   3 -> RED + FED (0b11) -- ou toute autre valeur, cf. "else" de
+ *        apply_deadband()
+ * Écrire ces valeurs en DÉCIMAL dans la Watch Window (1, 2, 3...),
+ * jamais en notation binaire "0b01"/"0b10" : CCS ne la supporte pas
+ * et l'ancienne valeur par défaut 11 (= onze en décimal) ne correspond à
+ * aucun cas testé explicitement, ce qui la faisait retomber dans le
+ * "else" (RED+FED actifs) -- d'où le bug "01/10 se comportent comme 11".
+ */
+volatile int DB_RISE_FALL = 3 ;
 
 
 volatile int APPLY_THIRD_H = 1;
@@ -59,7 +88,7 @@ volatile uint32_t increm     = 0U;
 volatile uint32_t accum      = 0U;        /* accumulateur de phase — référence Phase A  */
 volatile float    isr_amp    = 0.80f;     /* snapshot atomique pour l'ISR   */
 volatile float    isr_half   = 2500.0f;   /* TBPRD/2 pour l'ISR             */
-volatile uint16_t db_count   = 200U;      /* AJOUT DEAD-BAND : DEADBAND_NS en comptes TBCLK (5 ns/compte) */
+volatile uint16_t db_count   = 200U;      /* AJOUT DEAD-BAND : DEADBAND_NS en comptes TBCLK (5 ns/compte, mode HALF_CYCLE) */
 
 /*===========================================================================
  * DEBUG — Watch Window CCS
@@ -74,6 +103,10 @@ volatile float    dbg_phase  = 0.0f;
 volatile float    dbg_sin    = 0.0f;      /* Phase A */
 volatile float    dbg_sin_b  = 0.0f;      /* Phase B — AJOUT TRIPHASÉ */
 volatile float    dbg_sin_c  = 0.0f;      /* Phase C — AJOUT TRIPHASÉ */
+
+volatile uint32_t dbctl;
+volatile uint32_t dbred;
+volatile uint32_t dbfed;
 
 __interrupt void epwm1ISR(void);
 
@@ -99,31 +132,55 @@ static uint32_t calc_increm(float f_sin, float f_carrier)
 }
 
 /* AJOUT DEAD-BAND : ns → comptes TBCLK                                       */
-/* SYSCLK = 200 MHz, EPWMCLK = SYSCLK (pas de prescaler) → 1 compte = 5 ns    */
+/* SYSCLK = 200 MHz, EPWMCLK = SYSCLK (pas de prescaler), mode HALF_CYCLE     */
+/* => 1 compte = 5 ns (FIX : anciennement FULL_CYCLE => 10 ns/compte réel,    */
+/*    ce qui doublait chaque retard et faisait apparaître un écart x4)       */
 /* Registre RED/FED sur 10 bits utiles → max 1023 comptes ≈ 5115 ns          */
 static uint16_t calc_db_count(float ns)
 {
-    float counts_f = ns / 5.0f;             /* 1 compte TBCLK = 5 ns @200MHz */
+    float counts_f = ns / 5.0f;             /* 1 compte TBCLK = 5 ns @200MHz (HALF_CYCLE) */
     if(counts_f < 0.0f)    counts_f = 0.0f;
     if(counts_f > 1000.0f) counts_f = 1000.0f; /* garde-fou ~5 µs max        */
     return (uint16_t)counts_f;
 }
 
 /* AJOUT DEAD-BAND : applique RED=FED=db sur les 3 bras (mode AHC)            */
-static void apply_deadband(uint16_t db, uint8_t Rise, uint8_t Fall)
+/* RISE_FALL attendu en DÉCIMAL : 0 = bypass, 1 = FED seul, 2 = RED seul,     */
+/* 3 (ou autre) = RED+FED. Ne PAS utiliser de notation binaire "0bxx".        */
+static void apply_deadband(uint16_t db, uint8_t RISE_FALL)
 {
-    if (Rise)
+    uint32_t epwm_bases[] = {EPWM1_BASE, EPWM2_BASE, EPWM3_BASE};
+
+    int i = 0;
+
+    for ( i = 0; i < 3; i++) 
     {
-        EPWM_setRisingEdgeDelayCount(EPWM1_BASE, db);
-        EPWM_setRisingEdgeDelayCount(EPWM2_BASE, db);
-        EPWM_setRisingEdgeDelayCount(EPWM3_BASE, db);
-    }
-    
-    if (Fall)
-    {
-        EPWM_setFallingEdgeDelayCount(EPWM1_BASE, db);
-        EPWM_setFallingEdgeDelayCount(EPWM2_BASE, db);
-        EPWM_setFallingEdgeDelayCount(EPWM3_BASE, db);
+        uint32_t base = epwm_bases[i];
+
+        if (RISE_FALL == 0) // 0: No Deadband (Bypass)
+        {
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_RED, false); // Disable Rising Edge Delay
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_FED, false); // Disable Falling Edge Delay
+        } 
+        else if (RISE_FALL == 1) // 1 (0b01): Falling Edge Delay (FED) Only
+        {
+            EPWM_setFallingEdgeDelayCount(base, db);
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_RED, false); // Disable RED
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_FED, true);  // Enable FED
+        } 
+        else if (RISE_FALL == 2) // 2 (0b10): Rising Edge Delay (RED) Only
+        {
+            EPWM_setRisingEdgeDelayCount(base, db);
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_RED, true);  // Enable RED
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_FED, false); // Disable FED
+        } 
+        else // 3 (0b11) or anything else: Both RED and FED Enabled
+        {
+            EPWM_setRisingEdgeDelayCount(base, db);
+            EPWM_setFallingEdgeDelayCount(base, db);
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_RED, true);  // Enable RED
+            EPWM_setDeadBandDelayMode(base, EPWM_DB_FED, true);  // Enable FED
+        }
     }
 }
 
@@ -131,7 +188,7 @@ static void apply_deadband(uint16_t db, uint8_t Rise, uint8_t Fall)
 /* fc     : fréquence effective (fc_raw * 4) pour TBPRD                      */
 /* fc_raw : fréquence saisie par l'utilisateur pour le ratio DDS             */
 /* db_ns  : AJOUT DEAD-BAND — temps mort RED=FED en nanosecondes             */
-static void apply_params(float fc, float fc_raw, float fs, float amp, float db_ns)
+static void apply_params(float fc, float fc_raw, float fs, float amp, float db_ns, int RISE_FALL)
 {
     uint16_t tbprd_new  = calc_tbprd(fc);
     uint32_t increm_new = calc_increm(fs, fc_raw);
@@ -156,10 +213,11 @@ static void apply_params(float fc, float fc_raw, float fs, float amp, float db_n
     HWREG(EPWM3_BASE + EPWM_O_CMPA) = ((uint32_t)(tbprd_new / 2U) << 16U);
 
     /* 3bis. AJOUT DEAD-BAND : recharger RED/FED sur les 3 bras              */
-    apply_deadband(db_new, DB_RISE, DB_FALL);
+    apply_deadband(db_new, RISE_FALL);
 
     /* 4. Redémarrer la synchro (les 3 bras repartent alignés)               */
     SysCtl_enablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);
+
 
     /* 5. Mettre à jour les variables de l'ISR                               */
     TBPRD    = tbprd_new;
@@ -300,7 +358,12 @@ void main(void)
                                   EPWM_DB_POLARITY_ACTIVE_HIGH);
     EPWM_setDeadBandDelayPolarity(EPWM1_BASE, EPWM_DB_FED,
                                   EPWM_DB_POLARITY_ACTIVE_LOW);
-    EPWM_setDeadBandCounterClock(EPWM1_BASE, EPWM_DB_COUNTER_CLOCK_FULL_CYCLE);
+    /* FIX : HALF_CYCLE (pas FULL_CYCLE) => 1 compte DB = 1 période TBCLK
+     * = 5 ns @200MHz. FULL_CYCLE faisait tourner le compteur DB 2x plus
+     * lentement (1 compte = 2 périodes TBCLK = 10 ns), ce qui doublait
+     * silencieusement chaque retard RED/FED et donnait un écart x4 au lieu
+     * de x2 entre EPWMxA et EPWMxB une fois RED+FED combinés. */
+    EPWM_setDeadBandCounterClock(EPWM1_BASE, EPWM_DB_COUNTER_CLOCK_HALF_CYCLE);
     EPWM_setRisingEdgeDelayCount(EPWM1_BASE, db_count);
     EPWM_setFallingEdgeDelayCount(EPWM1_BASE, db_count);
     EPWM_setDeadBandDelayMode(EPWM1_BASE, EPWM_DB_RED, true);
@@ -340,7 +403,8 @@ void main(void)
                                   EPWM_DB_POLARITY_ACTIVE_HIGH);
     EPWM_setDeadBandDelayPolarity(EPWM2_BASE, EPWM_DB_FED,
                                   EPWM_DB_POLARITY_ACTIVE_LOW);
-    EPWM_setDeadBandCounterClock(EPWM2_BASE, EPWM_DB_COUNTER_CLOCK_FULL_CYCLE);
+    /* FIX : voir commentaire sur EPWM1_BASE ci-dessus */
+    EPWM_setDeadBandCounterClock(EPWM2_BASE, EPWM_DB_COUNTER_CLOCK_HALF_CYCLE);
     EPWM_setRisingEdgeDelayCount(EPWM2_BASE, db_count);
     EPWM_setFallingEdgeDelayCount(EPWM2_BASE, db_count);
     EPWM_setDeadBandDelayMode(EPWM2_BASE, EPWM_DB_RED, true);
@@ -384,7 +448,8 @@ void main(void)
                                   EPWM_DB_POLARITY_ACTIVE_HIGH);
     EPWM_setDeadBandDelayPolarity(EPWM3_BASE, EPWM_DB_FED,
                                   EPWM_DB_POLARITY_ACTIVE_LOW);
-    EPWM_setDeadBandCounterClock(EPWM3_BASE, EPWM_DB_COUNTER_CLOCK_FULL_CYCLE);
+    /* FIX : voir commentaire sur EPWM1_BASE ci-dessus */
+    EPWM_setDeadBandCounterClock(EPWM3_BASE, EPWM_DB_COUNTER_CLOCK_HALF_CYCLE);
     EPWM_setRisingEdgeDelayCount(EPWM3_BASE, db_count);
     EPWM_setFallingEdgeDelayCount(EPWM3_BASE, db_count);
     EPWM_setDeadBandDelayMode(EPWM3_BASE, EPWM_DB_RED, true);
@@ -411,10 +476,11 @@ void main(void)
     /*-----------------------------------------------------------------------
      * Boucle principale — détection de changement sur les 3 paramètres
      *---------------------------------------------------------------------*/
-    float last_fc  = FREQ_CARRIER;
-    float last_fs  = FREQ_SINUS;
-    float last_amp = AMPLITUDE;
-    float last_db  = DEADBAND_NS;   /* AJOUT DEAD-BAND */
+    float last_fc      = FREQ_CARRIER;
+    float last_fs      = FREQ_SINUS;
+    float last_amp     = AMPLITUDE;
+    float last_db      = DEADBAND_NS;   /* AJOUT DEAD-BAND */
+    int   last_RISE_FALL = DB_RISE_FALL;
 
     while(1)
     {
@@ -422,18 +488,25 @@ void main(void)
         float cur_fs  = FREQ_SINUS;
         float cur_amp = AMPLITUDE;
         float cur_db  = DEADBAND_NS;   /* AJOUT DEAD-BAND */
+        int   curr_RISE_FALL = DB_RISE_FALL;
 
         if(cur_fc != last_fc || cur_fs != last_fs || cur_amp != last_amp
-           || cur_db != last_db)
-        {
+           || cur_db != last_db || curr_RISE_FALL != last_RISE_FALL )
+        { 
             /* eff_carrier : x4 pour que f_oscillo = f_saisie */
             float eff_carrier = cur_fc * 4.0f;
-            apply_params(eff_carrier, cur_fc, cur_fs, cur_amp, cur_db);
+            apply_params(eff_carrier, cur_fc, cur_fs, cur_amp, cur_db, curr_RISE_FALL);
             last_fc  = cur_fc;
             last_fs  = cur_fs;
             last_amp = cur_amp;
             last_db  = cur_db;   /* AJOUT DEAD-BAND */
+            last_RISE_FALL = curr_RISE_FALL;
         }
+
+        dbctl = HWREG(EPWM1_BASE + EPWM_O_DBCTL);
+        dbred = HWREG(EPWM1_BASE + EPWM_O_DBRED);
+        dbfed = HWREG(EPWM1_BASE + EPWM_O_DBFED);
+        /* Export these to Watch Window or send over UART for inspection */
     }
 }
 
@@ -472,40 +545,60 @@ __interrupt void epwm1ISR(void)
     
     /* V_inj = 1/6 * sin(3*theta). À 90° (sinA=1), sin3 vaut -1, 
        ce qui donne 1 + 1/6*(-1) = 5/6, écrasant ainsi la bosse du signal. */
-    float injection ;
-    float max_sin;
+    volatile float injection ;
 
-    if (APPLY_THIRD_H){
-        injection = 0.166666667f * sin3;
-        max_sin = 1.1547 ; 
+    if (amp<0)  amp = 0;
+
+    float tab[3] = {sinA, sinB, sinC};
+
+    float min = sinA ;
+    float max = sinA ;
+
+    int i = 0;
+
+    for ( i = 0 ; i < 3 ; i++)
+    {
+        if (tab[i] < min) min = tab[i] ;
+        if (tab[i] > max) max = tab[i] ;
     }
-    else{
-        max_sin = 0 ;
+
+    switch  (APPLY_THIRD_H) {
+        case 0 :
         injection = 0 ;
+        break;
+        case 1 :
+        injection = 0.1666667 * sin3 ;
+        break;
+        case 2 :
+        injection = - 0.5f * (max + min) ;
+        break;
     }
 
     /* Application du signal modulant modifié aux 3 phases */
-    float modA = sinA + injection;
-    float modB = sinB + injection;
-    float modC = sinC + injection;
+    float modA = amp * sinA + injection;
+    float modB = amp * sinB + injection;
+    float modC = amp * sinC + injection;
 
     /* Mise à jour des variables de debug pour la Watch Window */
     dbg_sin   = modA;
     dbg_sin_b = modB;
     dbg_sin_c = modC;
 
+    
+
     /* Mise à l'échelle CMPA — calcul basé sur la modulante modifiée */
-    float cmpaA_f = half * (1.0f + amp * modA);
-    float cmpaB_f = half * (1.0f + amp * modB);
-    float cmpaC_f = half * (1.0f + amp * modC);
+    float cmpaA_f = half * (1.0f + modA);
+    float cmpaB_f = half * (1.0f + modB);
+    float cmpaC_f = half * (1.0f + modC);
+
 
     /* Saturation de sécurité (anti-overmodulation matérielle) */
     if(cmpaA_f < 0.0f)           cmpaA_f = 0.0f;
-    if(cmpaA_f > (float) (1 + max_sin) * TBPRD)   cmpaA_f = (float) (1 + max_sin) * TBPRD;
+    if(cmpaA_f > (float)TBPRD)   cmpaA_f = (float)TBPRD;
     if(cmpaB_f < 0.0f)           cmpaB_f = 0.0f;
-    if(cmpaB_f > (float) (1 + max_sin) * TBPRD)   cmpaB_f = (float) (1 + max_sin) * TBPRD;
+    if(cmpaB_f > (float)TBPRD)   cmpaB_f = (float)TBPRD;
     if(cmpaC_f < 0.0f)           cmpaC_f = 0.0f;
-    if(cmpaC_f > (float) (1 + max_sin) * TBPRD)   cmpaC_f = (float) (1 + max_sin) *TBPRD;
+    if(cmpaC_f > (float)TBPRD)   cmpaC_f = (float)TBPRD;
 
     uint16_t cmpaA_val = (uint16_t)cmpaA_f;
     uint16_t cmpaB_val = (uint16_t)cmpaB_f;

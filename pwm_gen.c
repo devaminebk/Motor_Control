@@ -49,7 +49,9 @@ volatile float AMPLITUDE    =  0.80f;    /* 0.0 … 1.0 — indice modulation  *
  *   => 1 compte DB = 5 ns.
  *   Plage raisonnable : 0 … 5000 ns (0 … 1000 comptes).
  *===========================================================================*/
-volatile float DEADBAND_NS = 1000.0f;    /* ns — temps mort RED = FED       */
+volatile float DEADBAND_RED_NS = 1000.0f;  /* ns — retard front montant (turn-on)  */
+volatile float DEADBAND_FED_NS = 1000.0f;  /* ns — retard front descendant (turn-off, généralement plus court) */
+
 
 volatile int APPLY_THIRD_H = 1;
 /*===========================================================================
@@ -68,8 +70,8 @@ volatile uint32_t increm     = 0U;
 volatile uint32_t accum      = 0U;        /* accumulateur de phase — référence Phase A  */
 volatile float    isr_amp    = 0.80f;     /* snapshot atomique pour l'ISR   */
 volatile float    isr_half   = 2500.0f;   /* TBPRD/2 pour l'ISR             */
-volatile uint16_t db_count   = 200U;      /* DEADBAND_NS en comptes TBCLK (5 ns/compte, mode HALF_CYCLE) */
-
+volatile uint16_t db_count_red = 200U;     /* comptes TBCLK — RED */
+volatile uint16_t db_count_fed = 200U;     /* comptes TBCLK — FED */
 /*===========================================================================
  * DEBUG — Watch Window CCS
  *===========================================================================*/
@@ -78,15 +80,14 @@ volatile uint16_t dbg_cmpa   = 0U;        /* Phase A */
 volatile uint16_t dbg_cmpa_b = 0U;        /* Phase B */
 volatile uint16_t dbg_cmpa_c = 0U;        /* Phase C */
 volatile uint16_t dbg_dac    = 0U;
-volatile uint16_t dbg_db_count = 0U;      /* comptes RED/FED réellement chargés */
+volatile uint16_t dbg_db_count_red = 0U;      /* comptes RED/FED réellement chargés */
+volatile uint16_t dbg_db_count_fed = 0U;      /* comptes RED/FED réellement chargés */
 volatile float    dbg_phase  = 0.0f;
 volatile float    dbg_sin    = 0.0f;      /* Phase A */
 volatile float    dbg_sin_b  = 0.0f;      /* Phase B */
 volatile float    dbg_sin_c  = 0.0f;      /* Phase C */
 
-volatile uint32_t dbctl;
-volatile uint32_t dbred;
-volatile uint32_t dbfed;
+
 
 __interrupt void epwm1ISR(void);
 
@@ -117,7 +118,7 @@ static uint32_t calc_increm(float f_sin, float f_carrier)
 /* comptes ≈ 5115 ns.                                                        */
 static uint16_t calc_db_count(float ns)
 {
-    float counts_f = ns / 5.0f;             /* 1 compte TBCLK = 5 ns @200MHz (HALF_CYCLE) */
+    float counts_f = ns / 10.0f;             /* 1 compte TBCLK = 5 ns @200MHz (HALF_CYCLE) */
     if(counts_f < 0.0f)    counts_f = 0.0f;
     if(counts_f > 1000.0f) counts_f = 1000.0f; /* garde-fou ~5 µs max        */
     return (uint16_t)counts_f;
@@ -126,15 +127,15 @@ static uint16_t calc_db_count(float ns)
 /* Recharge RED=FED=db sur les 3 bras. RED et FED sont déjà activés en
  * permanence (mode AHC, configuré une seule fois dans main()) : il n'y a
  * donc plus qu'à mettre à jour le COMPTE, pas le mode.                      */
-static void apply_deadband(uint16_t db)
+static void apply_deadband(uint16_t db_red, uint16_t db_fed)
 {
     uint32_t epwm_bases[] = {EPWM1_BASE, EPWM2_BASE, EPWM3_BASE};
     int i;
 
     for(i = 0; i < 3; i++)
     {
-        EPWM_setRisingEdgeDelayCount(epwm_bases[i], db);
-        EPWM_setFallingEdgeDelayCount(epwm_bases[i], db);
+        EPWM_setRisingEdgeDelayCount(epwm_bases[i], db_red);
+        EPWM_setFallingEdgeDelayCount(epwm_bases[i], db_fed);
     }
 }
 
@@ -142,12 +143,13 @@ static void apply_deadband(uint16_t db)
 /* fc     : fréquence effective (fc_raw * 4) pour TBPRD                      */
 /* fc_raw : fréquence saisie par l'utilisateur pour le ratio DDS             */
 /* db_ns  : temps mort RED=FED en nanosecondes                              */
-static void apply_params(float fc, float fc_raw, float fs, float amp, float db_ns)
+static void apply_params(float fc, float fc_raw, float fs, float amp, float db_red_ns, float db_fed_ns)
 {
     uint16_t tbprd_new  = calc_tbprd(fc);
     uint32_t increm_new = calc_increm(fs, fc_raw);
     float    half_new   = (float)tbprd_new * 0.5f;
-    uint16_t db_new     = calc_db_count(db_ns);
+    uint16_t db_red_new  = calc_db_count(db_red_ns);
+    uint16_t db_fed_new  = calc_db_count(db_fed_ns);
 
     /* Section critique : on coupe les IRQ le temps de tout mettre à jour    */
     DINT;
@@ -166,7 +168,7 @@ static void apply_params(float fc, float fc_raw, float fs, float amp, float db_n
     HWREG(EPWM3_BASE + EPWM_O_CMPA) = ((uint32_t)(tbprd_new / 2U) << 16U);
 
     /* 3bis. Recharger RED/FED (compte uniquement) sur les 3 bras            */
-    apply_deadband(db_new);
+    apply_deadband(db_red_new, db_fed_new);
 
     /* 4. Redémarrer la synchro (les 3 bras repartent alignés)               */
     SysCtl_enablePeripheral(SYSCTL_PERIPH_CLK_TBCLKSYNC);
@@ -177,8 +179,10 @@ static void apply_params(float fc, float fc_raw, float fs, float amp, float db_n
     isr_amp  = amp;
     increm   = increm_new;
     accum    = 0U;   /* reset phase pour éviter un saut de phase             */
-    db_count = db_new;
-    dbg_db_count = db_new;
+    db_count_red = db_red_new;
+    db_count_fed = db_fed_new;
+    dbg_db_count_red = db_red_new;
+    dbg_db_count_fed = db_fed_new;
 
     EINT;
 }
@@ -202,8 +206,10 @@ void main(void)
     isr_amp  = AMPLITUDE;
     increm   = calc_increm(FREQ_SINUS, FREQ_CARRIER);
     accum    = 0U;
-    db_count = calc_db_count(DEADBAND_NS);
-    dbg_db_count = db_count;
+    db_count_red = calc_db_count(DEADBAND_RED_NS);
+    db_count_fed = calc_db_count(DEADBAND_FED_NS);
+    dbg_db_count_red = db_count_red;
+    dbg_db_count_fed = db_count_fed;
 
     /* GPIO0 → ePWM1A (Phase A) */
     GPIO_setPadConfig(0, GPIO_PIN_TYPE_STD);
@@ -311,8 +317,8 @@ void main(void)
                                   EPWM_DB_POLARITY_ACTIVE_LOW);
     /* HALF_CYCLE => 1 compte DB = 1 période TBCLK = 5 ns @200MHz */
     EPWM_setDeadBandCounterClock(EPWM1_BASE, EPWM_DB_COUNTER_CLOCK_HALF_CYCLE);
-    EPWM_setRisingEdgeDelayCount(EPWM1_BASE, db_count);
-    EPWM_setFallingEdgeDelayCount(EPWM1_BASE, db_count);
+    EPWM_setRisingEdgeDelayCount(EPWM1_BASE, db_count_red);
+    EPWM_setFallingEdgeDelayCount(EPWM1_BASE, db_count_fed);
     EPWM_setDeadBandDelayMode(EPWM1_BASE, EPWM_DB_RED, true);
     EPWM_setDeadBandDelayMode(EPWM1_BASE, EPWM_DB_FED, true);
 
@@ -351,8 +357,8 @@ void main(void)
     EPWM_setDeadBandDelayPolarity(EPWM2_BASE, EPWM_DB_FED,
                                   EPWM_DB_POLARITY_ACTIVE_LOW);
     EPWM_setDeadBandCounterClock(EPWM2_BASE, EPWM_DB_COUNTER_CLOCK_HALF_CYCLE);
-    EPWM_setRisingEdgeDelayCount(EPWM2_BASE, db_count);
-    EPWM_setFallingEdgeDelayCount(EPWM2_BASE, db_count);
+    EPWM_setRisingEdgeDelayCount(EPWM2_BASE, db_count_red);
+    EPWM_setFallingEdgeDelayCount(EPWM2_BASE, db_count_fed);
     EPWM_setDeadBandDelayMode(EPWM2_BASE, EPWM_DB_RED, true);
     EPWM_setDeadBandDelayMode(EPWM2_BASE, EPWM_DB_FED, true);
 
@@ -395,8 +401,8 @@ void main(void)
     EPWM_setDeadBandDelayPolarity(EPWM3_BASE, EPWM_DB_FED,
                                   EPWM_DB_POLARITY_ACTIVE_LOW);
     EPWM_setDeadBandCounterClock(EPWM3_BASE, EPWM_DB_COUNTER_CLOCK_HALF_CYCLE);
-    EPWM_setRisingEdgeDelayCount(EPWM3_BASE, db_count);
-    EPWM_setFallingEdgeDelayCount(EPWM3_BASE, db_count);
+    EPWM_setRisingEdgeDelayCount(EPWM3_BASE, db_count_red);
+    EPWM_setFallingEdgeDelayCount(EPWM3_BASE, db_count_fed);
     EPWM_setDeadBandDelayMode(EPWM3_BASE, EPWM_DB_RED, true);
     EPWM_setDeadBandDelayMode(EPWM3_BASE, EPWM_DB_FED, true);
 
@@ -424,31 +430,31 @@ void main(void)
     float last_fc  = FREQ_CARRIER;
     float last_fs  = FREQ_SINUS;
     float last_amp = AMPLITUDE;
-    float last_db  = DEADBAND_NS;
+    float last_db_red  = DEADBAND_RED_NS;
+    float last_db_fed  = DEADBAND_FED_NS;
 
     while(1)
     {
         float cur_fc  = FREQ_CARRIER;
         float cur_fs  = FREQ_SINUS;
         float cur_amp = AMPLITUDE;
-        float cur_db  = DEADBAND_NS;
+        float cur_db_red  = DEADBAND_RED_NS;
+        float cur_db_fed  = DEADBAND_FED_NS;
 
         if(cur_fc != last_fc || cur_fs != last_fs || cur_amp != last_amp
-           || cur_db != last_db)
+           || cur_db_red != last_db_red || cur_db_fed != last_db_fed)
         {
             /* eff_carrier : x4 pour que f_oscillo = f_saisie */
             float eff_carrier = cur_fc * 4.0f;
-            apply_params(eff_carrier, cur_fc, cur_fs, cur_amp, cur_db);
+            apply_params(eff_carrier, cur_fc, cur_fs, cur_amp, cur_db_red, cur_db_fed);
             last_fc  = cur_fc;
             last_fs  = cur_fs;
             last_amp = cur_amp;
-            last_db  = cur_db;
+            last_db_red  = cur_db_red;
+            last_db_fed  = cur_db_fed;
         }
 
-        dbctl = HWREG(EPWM1_BASE + EPWM_O_DBCTL);
-        dbred = HWREG(EPWM1_BASE + EPWM_O_DBRED);
-        dbfed = HWREG(EPWM1_BASE + EPWM_O_DBFED);
-        /* Export these to Watch Window or send over UART for inspection */
+
     }
 }
 
